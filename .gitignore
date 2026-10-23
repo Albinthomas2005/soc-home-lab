@@ -21,6 +21,7 @@ alerts/
 backups/
 *.backup
 *.bak
+*.gemini-backup
 *.tmp
 .coverage
 htmlcov/
