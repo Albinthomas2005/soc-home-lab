@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import patch
 
 from app import app
-from gemini_service import GeminiUnavailable
+from gemini_service import GeminiUnavailable, generate_investigation_report
 
 
 INTERNAL_TOKEN = "unit-test-internal-token"
@@ -155,6 +155,238 @@ class TestAnalyzeAlertAPI(unittest.TestCase):
             {"ok": False, "error": "Request body is too large"},
         )
 
+
+class TestGenerateReportAPI(unittest.TestCase):
+    def setUp(self):
+        self.env_patch = patch.dict(
+            os.environ,
+            {"SOC_AI_INTERNAL_TOKEN": INTERNAL_TOKEN},
+        )
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
+        self.client = app.test_client()
+        self.headers = {"Authorization": f"Bearer {INTERNAL_TOKEN}"}
+        self.payload = {
+            "evidence": {
+                "index": "wazuh-alerts-4.x-2026.10.25",
+                "id": "synthetic-alert-id",
+                "alert": {
+                    "@timestamp": "2026-10-25T10:00:00Z",
+                    "rule": {
+                        "id": "1001",
+                        "mitre": {"technique": ["T1110"]},
+                        "description": "Synthetic login failure from 8.8.8.8",
+                        "unsupported_field": "must not leave this process",
+                    },
+                    "data": {
+                        "srcip": "8.8.8.8",
+                        "authentication_result": "failed",
+                        "password": "synthetic-secret",
+                    },
+                    "full_log": "unfiltered synthetic raw log",
+                    "email": "analyst@example.invalid",
+                },
+            },
+            "analyst_notes": "Synthetic context analyst@example.invalid",
+        }
+
+    def post_report(self, payload=None, headers=None):
+        return self.client.post(
+            "/api/ai/generate-report",
+            json=self.payload if payload is None else payload,
+            headers=self.headers if headers is None else headers,
+        )
+
+    def post_alert(self, alert, headers=None):
+        return self.client.post(
+            ENDPOINT,
+            json={"alert": alert},
+            headers=self.headers if headers is None else headers,
+        )
+
+    def test_missing_or_incorrect_token_is_rejected(self):
+        with patch("app.generate_investigation_report") as generate:
+            response = self.post_report(headers={"Authorization": "Bearer wrong"})
+
+        self.assertEqual(response.status_code, 401)
+        generate.assert_not_called()
+
+    def test_missing_server_token_is_rejected(self):
+        with patch.dict(os.environ, {"SOC_AI_INTERNAL_TOKEN": ""}):
+            response = self.post_report()
+        self.assertEqual(response.status_code, 401)
+
+    def test_invalid_payloads_are_rejected(self):
+        invalid = [
+            {},
+            {"evidence": self.payload["evidence"], "unexpected": "value"},
+            {"evidence": {**self.payload["evidence"], "extra": "value"}},
+            {"evidence": {**self.payload["evidence"], "index": "other-index"}},
+            {"evidence": {**self.payload["evidence"], "index": "wazuh-alerts-5.x-2026.10.25"}},
+            {"evidence": {**self.payload["evidence"], "id": ""}},
+            {"evidence": {**self.payload["evidence"], "alert": []}},
+            {"evidence": self.payload["evidence"], "analyst_notes": []},
+            {
+                "evidence": self.payload["evidence"],
+                "analyst_notes": "x" * 4001,
+            },
+        ]
+        with patch("app.generate_investigation_report") as generate:
+            for payload in invalid:
+                with self.subTest(payload=payload):
+                    response = self.post_report(payload)
+                    self.assertEqual(response.status_code, 400)
+                    self.assertFalse(response.get_json()["ok"])
+        generate.assert_not_called()
+
+    def test_malformed_and_non_json_requests_are_rejected(self):
+        malformed = self.client.post(
+            "/api/ai/generate-report",
+            data="{malformed",
+            content_type="application/json",
+            headers=self.headers,
+        )
+        non_json = self.client.post(
+            "/api/ai/generate-report",
+            data="not-json",
+            content_type="text/plain",
+            headers=self.headers,
+        )
+        self.assertEqual(malformed.status_code, 400)
+        self.assertEqual(non_json.status_code, 400)
+
+    def test_oversized_request_is_rejected(self):
+        oversized = {
+            "evidence": self.payload["evidence"],
+            "analyst_notes": "x" * (256 * 1024),
+        }
+        response = self.post_report(oversized)
+        self.assertEqual(response.status_code, 413)
+
+    def test_global_oversized_report_request_returns_json_error(self):
+        response = self.client.post(
+            "/api/ai/generate-report",
+            data=b"x" * (1024 * 1024 + 1),
+            content_type="application/json",
+            headers=self.headers,
+        )
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(
+            response.get_json(),
+            {"ok": False, "error": "Report request is too large"},
+        )
+
+    def test_evidence_and_notes_are_minimized_and_sanitized(self):
+        report = "Synthetic report draft"
+        with patch("app.generate_investigation_report", return_value=report) as generate:
+            response = self.post_report()
+
+        self.assertEqual(response.status_code, 200)
+        result = response.get_json()
+        self.assertEqual(set(result), {"ok", "status", "evidence", "report"})
+        self.assertIs(result["ok"], True)
+        self.assertEqual(result["status"], "ai_generated_unverified")
+        self.assertEqual(
+            result["evidence"],
+            {
+                "index": "wazuh-alerts-4.x-2026.10.25",
+                "id": "synthetic-alert-id",
+                "alert": {
+                    "@timestamp": "2026-10-25T10:00:00Z",
+                    "rule": {
+                        "id": "1001",
+                        "mitre": {"technique": ["T1110"]},
+                        "description": "Synthetic login failure from [REDACTED_PUBLIC_IP]",
+                    },
+                    "data": {
+                        "srcip": "[REDACTED_PUBLIC_IP]",
+                        "authentication_result": "failed",
+                    },
+                },
+            },
+        )
+        self.assertIsInstance(result["report"], str)
+        self.assertTrue(result["report"].strip())
+        serialized = str(result["evidence"])
+        self.assertNotIn("synthetic-secret", serialized)
+        self.assertNotIn("unfiltered synthetic raw log", serialized)
+        self.assertNotIn("analyst@example.invalid", serialized)
+        call_args = generate.call_args.args
+        self.assertEqual(call_args[0]["rule"]["id"], "1001")
+        self.assertEqual(call_args[0]["rule"]["mitre"]["technique"], ["T1110"])
+        self.assertNotIn("unsupported_field", str(call_args[0]))
+        self.assertNotIn("full_log", str(call_args[0]))
+        self.assertIn("[REDACTED_EMAIL]", call_args[1])
+
+    def test_provider_errors_return_safe_responses(self):
+        with patch(
+            "app.generate_investigation_report",
+            side_effect=GeminiUnavailable("private provider detail"),
+        ):
+            response = self.post_report()
+
+        self.assertEqual(response.status_code, 503)
+        self.assertNotIn(b"private provider detail", response.data)
+
+    def test_unexpected_errors_return_safe_responses(self):
+        with patch(
+            "app.generate_investigation_report",
+            side_effect=RuntimeError("private internal detail"),
+        ):
+            response = self.post_report()
+
+        self.assertEqual(response.status_code, 500)
+        self.assertNotIn(b"private internal detail", response.data)
+
+    def test_report_prompt_requires_evidence_separation_and_uncertainty(self):
+        provider_response = """## AI assessment (unverified)
+Synthetic hypothesis.
+
+## Unknowns and limitations
+The supplied record is insufficient.
+
+## Recommended investigation steps
+Review related records.
+"""
+        with patch("gemini_service._generate", return_value=provider_response) as generate:
+            result = generate_investigation_report(
+                {"rule": {"id": "1001"}}, "synthetic notes"
+            )
+
+        self.assertTrue(result.startswith("AI-GENERATED DRAFT — UNVERIFIED"))
+        prompt = generate.call_args.args[0]
+        system_prompt = generate.call_args.kwargs["system_prompt"]
+        for heading in (
+            "AI assessment (unverified)",
+            "Unknowns and limitations",
+            "Recommended investigation steps",
+        ):
+            self.assertIn(heading, prompt)
+        self.assertIn("untrusted data", system_prompt)
+        self.assertIn("invent events", system_prompt)
+
+    def test_report_has_deterministic_evidence_and_analyst_placeholder(self):
+        provider_response = """## AI assessment (unverified)
+Synthetic hypothesis.
+
+## Unknowns and limitations
+Insufficient evidence.
+
+## Recommended investigation steps
+Check related records.
+"""
+        with patch("gemini_service._generate", return_value=provider_response):
+            report = generate_investigation_report(
+                {"rule": {"id": "1001"}}, "synthetic note"
+            )
+
+        self.assertIn('Allowlisted record fields (JSON): {"rule": {"id": "1001"}}', report)
+        self.assertIn("Not yet verified by an analyst.", report)
+
+    def test_incomplete_provider_report_is_rejected(self):
+        with patch("gemini_service._generate", return_value="Incomplete draft"):
+            with self.assertRaises(GeminiUnavailable):
+                generate_investigation_report({"rule": {"id": "1001"}})
 
 if __name__ == "__main__":
     unittest.main()

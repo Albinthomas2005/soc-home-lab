@@ -1,4 +1,5 @@
 import ipaddress
+import math
 import re
 
 EMAIL_RE = re.compile(
@@ -23,6 +24,28 @@ SECRET_RE = re.compile(
 SENSITIVE_KEYS = re.compile(
     r"(?i)(password|passwd|token|secret|api[_-]?key|"
     r"authorization|credential|private[_-]?key)"
+)
+
+REPORT_EVIDENCE_FIELDS = (
+    "@timestamp",
+    "timestamp",
+    "rule.id",
+    "rule.level",
+    "rule.description",
+    "rule.groups",
+    "rule.mitre.id",
+    "rule.mitre.tactic",
+    "rule.mitre.technique",
+    "decoder.name",
+    "agent.id",
+    "data.srcip",
+    "data.dstip",
+    "data.srcport",
+    "data.dstport",
+    "data.protocol",
+    "data.action",
+    "data.authentication_result",
+    "data.win.system.eventID",
 )
 
 
@@ -69,3 +92,42 @@ def sanitize_alert(value, parent_key=""):
         return sanitize_text(value)
 
     return value
+
+
+def minimize_report_evidence(alert):
+    """Keep only scalar alert fields approved for external AI analysis."""
+    if not isinstance(alert, dict):
+        return {}
+
+    minimized = {}
+    for field in REPORT_EVIDENCE_FIELDS:
+        value = alert
+        for part in field.split("."):
+            if not isinstance(value, dict) or part not in value:
+                value = None
+                break
+            value = value[part]
+
+        if isinstance(value, float) and not math.isfinite(value):
+            continue
+        if isinstance(value, (str, int, float, bool)):
+            accepted = value
+        elif isinstance(value, list):
+            accepted = [
+                item
+                for item in value
+                if isinstance(item, (str, int, float, bool))
+                and not (isinstance(item, float) and not math.isfinite(item))
+            ][:50]
+            if not accepted:
+                continue
+        else:
+            continue
+
+        target = minimized
+        parts = field.split(".")
+        for part in parts[:-1]:
+            target = target.setdefault(part, {})
+        target[parts[-1]] = accepted
+
+    return sanitize_alert(minimized)

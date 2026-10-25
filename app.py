@@ -2,6 +2,7 @@
 import hmac
 import json
 import os
+import re
 
 from dotenv import load_dotenv
 from flask import (
@@ -20,25 +21,37 @@ from database import (
 )
 from gemini_service import (
     explain_alert,
+    generate_investigation_report,
     improve_report,
     GeminiUnavailable,
 )
-from privacy_filter import sanitize_alert
+from privacy_filter import (
+    minimize_report_evidence,
+    sanitize_alert,
+    sanitize_text,
+)
 
 # Load environment variables from the local .env file.
 load_dotenv()
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024
+MAX_REPORT_REQUEST_BYTES = 256 * 1024
+MAX_ANALYST_NOTES_CHARS = 4000
 
 
 @app.errorhandler(413)
 def handle_request_too_large(error):
-    if request.path == "/api/ai/analyze-alert":
-        return jsonify(
-            ok=False,
-            error="Request body is too large",
-        ), 413
+    if request.path in (
+        "/api/ai/analyze-alert",
+        "/api/ai/generate-report",
+    ):
+        message = (
+            "Report request is too large"
+            if request.path == "/api/ai/generate-report"
+            else "Request body is too large"
+        )
+        return jsonify(ok=False, error=message), 413
     return error
 
 # Initialize the local database.
@@ -61,6 +74,22 @@ def get_ai_status():
     return (
         "AI unavailable — configure GROQ_API_KEY in .env.",
         False,
+    )
+
+
+def has_valid_internal_token():
+    expected_token = os.environ.get("SOC_AI_INTERNAL_TOKEN", "")
+    authorization = request.headers.get("Authorization", "")
+    scheme, separator, supplied_token = authorization.partition(" ")
+    return bool(
+        expected_token
+        and separator
+        and scheme.lower() == "bearer"
+        and supplied_token
+        and hmac.compare_digest(
+            supplied_token.encode("utf-8"),
+            expected_token.encode("utf-8"),
+        )
     )
 
 
@@ -163,20 +192,7 @@ def explain_alert_route():
 
 @app.route("/api/ai/analyze-alert", methods=["POST"])
 def analyze_alert_api():
-    expected_token = os.environ.get("SOC_AI_INTERNAL_TOKEN", "")
-    authorization = request.headers.get("Authorization", "")
-    scheme, separator, supplied_token = authorization.partition(" ")
-
-    if (
-        not expected_token
-        or not separator
-        or scheme.lower() != "bearer"
-        or not supplied_token
-        or not hmac.compare_digest(
-            supplied_token.encode("utf-8"),
-            expected_token.encode("utf-8"),
-        )
-    ):
+    if not has_valid_internal_token():
         return jsonify(ok=False, error="Authentication required"), 401
 
     if not request.is_json:
@@ -205,6 +221,88 @@ def analyze_alert_api():
         ), 500
 
     return jsonify(ok=True, analysis=analysis)
+
+
+@app.route("/api/ai/generate-report", methods=["POST"])
+def generate_report_api():
+    if not has_valid_internal_token():
+        return jsonify(ok=False, error="Authentication required"), 401
+
+    if len(request.get_data(cache=True)) > MAX_REPORT_REQUEST_BYTES:
+        return jsonify(ok=False, error="Report request is too large"), 413
+
+    if not request.is_json:
+        return jsonify(ok=False, error="A JSON report request is required"), 400
+
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or set(payload) - {"evidence", "analyst_notes"}:
+        return jsonify(ok=False, error="Invalid report request"), 400
+
+    evidence = payload.get("evidence")
+    if not isinstance(evidence, dict):
+        return jsonify(ok=False, error="A valid selected alert is required"), 400
+    record_id = evidence.get("id")
+    analyst_notes = payload.get("analyst_notes", "")
+    try:
+        record_id_bytes = (
+            len(record_id.encode("utf-8")) if isinstance(record_id, str) else 0
+        )
+        if isinstance(analyst_notes, str):
+            analyst_notes.encode("utf-8")
+    except UnicodeEncodeError:
+        return jsonify(ok=False, error="Report text must be valid UTF-8"), 400
+
+    if (
+        set(evidence) != {"index", "id", "alert"}
+        or not isinstance(evidence.get("index"), str)
+        or not re.fullmatch(
+            r"wazuh-alerts-4\.x-[a-z0-9][a-z0-9._-]*", evidence["index"]
+        )
+        or not isinstance(evidence.get("id"), str)
+        or not record_id
+        or record_id_bytes > 512
+        or not isinstance(evidence.get("alert"), dict)
+    ):
+        return jsonify(ok=False, error="A valid selected alert is required"), 400
+
+    if (
+        not isinstance(analyst_notes, str)
+        or len(analyst_notes) > MAX_ANALYST_NOTES_CHARS
+    ):
+        return jsonify(ok=False, error="Analyst notes are invalid or too long"), 400
+
+    safe_alert = minimize_report_evidence(evidence["alert"])
+    if not safe_alert:
+        return jsonify(ok=False, error="Alert has no analyzable fields"), 422
+
+    safe_evidence = {
+        "index": evidence["index"],
+        "id": evidence["id"],
+        "alert": safe_alert,
+    }
+    safe_notes = sanitize_text(analyst_notes)
+    if len(json.dumps(safe_evidence, ensure_ascii=False).encode("utf-8")) > MAX_REPORT_REQUEST_BYTES:
+        return jsonify(ok=False, error="Report evidence is too large"), 413
+
+    try:
+        report = generate_investigation_report(safe_alert, safe_notes)
+    except GeminiUnavailable:
+        return jsonify(
+            ok=False,
+            error="AI report generation is temporarily unavailable",
+        ), 503
+    except Exception:
+        return jsonify(
+            ok=False,
+            error="AI report generation could not be completed",
+        ), 500
+
+    return jsonify(
+        ok=True,
+        status="ai_generated_unverified",
+        evidence=safe_evidence,
+        report=report,
+    )
 
 
 @app.route("/improve-report", methods=["POST"])
