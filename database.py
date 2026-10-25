@@ -12,7 +12,9 @@ def get_connection():
 
 
 def init_db():
+    """Create required tables without deleting existing data."""
     with get_connection() as connection:
+        # Existing dashboard summary table.
         connection.execute("""
             CREATE TABLE IF NOT EXISTS alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -21,6 +23,22 @@ def init_db():
                 rule TEXT NOT NULL,
                 source_ip TEXT,
                 status TEXT NOT NULL DEFAULT 'New'
+            )
+        """)
+
+        # Existing importer tracking table.
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS wazuh_imports (
+                wazuh_id TEXT PRIMARY KEY
+            )
+        """)
+
+        # Store original Wazuh alert JSON for the dashboard.
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS wazuh_raw_alerts (
+                wazuh_id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                raw_json TEXT NOT NULL
             )
         """)
 
@@ -41,13 +59,8 @@ def get_alerts():
         """).fetchall()
 
 
-if __name__ == "__main__":
-    init_db()
-    print(f"Database created: {DB_PATH}")
-
-
 def get_raw_alerts(limit=100):
-    """Return recent raw Wazuh alerts without modifying their stored JSON."""
+    """Return recent raw Wazuh alerts."""
     with get_connection() as connection:
         return connection.execute("""
             SELECT wazuh_id, timestamp, raw_json
@@ -58,10 +71,15 @@ def get_raw_alerts(limit=100):
 
 
 def get_raw_alert(wazuh_id):
-    """Retrieve one complete original Wazuh alert by its ID."""
+    """Retrieve one original Wazuh alert by ID."""
     with get_connection() as connection:
         return connection.execute("""
             SELECT wazuh_id, timestamp, raw_json
             FROM wazuh_raw_alerts
             WHERE wazuh_id = ?
         """, (wazuh_id,)).fetchone()
+
+
+if __name__ == "__main__":
+    init_db()
+    print(f"Database initialized: {DB_PATH}")

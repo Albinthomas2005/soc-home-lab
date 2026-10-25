@@ -38,6 +38,26 @@ cp .env.example .env
 
 Edit `.env` locally and set your own `GROQ_API_KEY`. Never commit the real `.env` file. OpenSearch connection settings and credentials must be configured locally according to your deployment and the integration script.
 
+## Internal AI analysis API
+
+The local Flask service provides `POST /api/ai/analyze-alert` for trusted
+services that need an AI explanation. It requires a bearer token in the
+`SOC_AI_INTERNAL_TOKEN` environment variable, accepts a JSON object containing
+an `alert` object, sanitizes the alert before analysis, and returns JSON. The
+endpoint shares the app's 1 MiB request-size limit and is not intended for
+public exposure. The included Flask runner binds to `127.0.0.1`.
+
+Generate a strong token locally with:
+
+```bash
+python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
+```
+
+Set the generated value as `SOC_AI_INTERNAL_TOKEN` in the ignored local `.env`
+file (or the service's protected environment configuration). Configure the
+same value securely in any trusted caller. Do not commit, log, or share the
+token. Keep `.env.example` as a placeholder only.
+
 ## Run tests
 
 ```bash
